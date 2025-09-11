@@ -8,7 +8,6 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 import vtk
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 from analyzer import CylinderAnalyzer, Config
-from utils.data_io import load_txt_points
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 import pandas as pd
@@ -73,6 +72,122 @@ class LoadPointCloudWorker(QThread):
         except Exception as e:
             self.error.emit(str(e))
 
+class LoadMultiplePointCloudWorker(QThread):
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(tuple)
+    error = pyqtSignal(str)
+    
+    def __init__(self, filenames):
+        super().__init__()
+        self.filenames = filenames
+        
+    def run(self):
+        try:
+            all_points = []
+            total_files = len(self.filenames)
+            
+            for file_idx, filename in enumerate(self.filenames):
+                # Calculate base progress for this file
+                base_progress = int((file_idx / total_files) * 90)
+                file_progress_range = int(90 / total_files)  # Each file gets portion of 90%
+                
+                try:
+                    # Parse each file with progress tracking
+                    file_points = self.parse_file_with_progress(filename, base_progress, file_progress_range)
+                    
+                    if len(file_points) == 0:
+                        print(f"Warning: No valid points found in {filename}")
+                        continue
+                        
+                    all_points.extend(file_points)
+                    print(f"Loaded {len(file_points):,} points from {os.path.basename(filename)}")
+                    
+                except Exception as e:
+                    self.error.emit(f"Error reading {filename}: {str(e)}")
+                    return
+                
+                # Update progress after each file
+                self.progress.emit(int(((file_idx + 1) / total_files) * 90))
+            
+            self.progress.emit(95)
+            
+            if len(all_points) == 0:
+                self.error.emit("No points loaded from any file")
+                return
+                
+            # Convert to numpy array
+            points = np.array(all_points, dtype=np.float64)
+            
+            # Validate and clean data
+            if points.shape[1] < 3:
+                self.error.emit("Points must have at least 3 coordinates (X, Y, Z)")
+                return
+                
+            # Take only first 3 columns and remove invalid points
+            points = points[:, :3]
+            valid_mask = np.all(np.isfinite(points), axis=1)
+            points = points[valid_mask]
+            
+            if len(points) == 0:
+                self.error.emit("No valid points after filtering")
+                return
+            
+            self.progress.emit(100)
+            self.finished.emit((points, len(points)))
+            
+        except Exception as e:
+            self.error.emit(f"Unexpected error: {str(e)}")
+    
+    def parse_file_with_progress(self, filename, base_progress, progress_range):
+        """Parse single file with progress updates"""
+        points = []
+        
+        try:
+            # Try pandas for CSV files first
+            if filename.lower().endswith('.csv'):
+                import pandas as pd
+                df = pd.read_csv(filename)
+                if len(df.columns) >= 3:
+                    return df.iloc[:, :3].values.tolist()
+        except:
+            pass
+        
+        # Manual parsing for text files with progress
+        try:
+            # Count total lines first for progress calculation
+            with open(filename, 'r') as f:
+                total_lines = sum(1 for _ in f)
+            
+            # Parse with progress updates
+            with open(filename, 'r') as f:
+                for line_num, line in enumerate(f):
+                    line = line.strip()
+                    
+                    # Skip empty lines and comments
+                    if not line or line.startswith('#') or line.startswith('//'):
+                        continue
+                    
+                    try:
+                        # Handle different separators
+                        line = line.replace(',', ' ').replace(';', ' ').replace('\t', ' ')
+                        coords = [float(x) for x in line.split() if x]
+                        
+                        if len(coords) >= 3:
+                            points.append(coords[:3])
+                            
+                    except ValueError:
+                        continue
+                    
+                    # Update progress every 5000 lines to avoid too frequent updates
+                    if line_num % 5000 == 0 and total_lines > 0:
+                        file_progress = int((line_num / total_lines) * progress_range)
+                        self.progress.emit(base_progress + file_progress)
+        
+        except Exception as e:
+            print(f"Error parsing {filename}: {e}")
+            
+        return points
+    
 class CylinderAnalyzerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -143,11 +258,25 @@ class CylinderAnalyzerGUI(QMainWindow):
         param_layout.addWidget(QLabel("Angle Bins:"))
         param_layout.addWidget(self.angle_bins)
 
+        quality_group = QWidget()
+        quality_layout = QVBoxLayout(quality_group)  # Changed to vertical
+        
+        quality_layout.addWidget(QLabel("Display Quality:"))
+        
+        self.quality_dropdown = QComboBox()
+        self.quality_dropdown.addItems(["Ultra High", "High", "Medium", "Fast"])
+        self.quality_dropdown.setCurrentText("Medium")  # Default
+        self.quality_dropdown.currentTextChanged.connect(self.on_quality_changed)
+        quality_layout.addWidget(self.quality_dropdown)
+        
+        control_layout.addWidget(quality_group)
+        self.display_quality = 'medium'
+
         # Add checkbox for auto visualization
         self.auto_visualize = QCheckBox("Auto visualize slices after analysis")
         self.auto_visualize.setChecked(True)  # Default to enabled
         param_layout.addWidget(self.auto_visualize)
-        
+    
         # Analysis button
         analyze_btn = QPushButton("Analyze Slice")
         analyze_btn.clicked.connect(self.analyze_current)
@@ -162,7 +291,29 @@ class CylinderAnalyzerGUI(QMainWindow):
         
         control_layout.addWidget(param_group)
         control_layout.addStretch()
-        
+
+        # Add memory monitor and controls
+        memory_group = QWidget()
+        memory_layout = QVBoxLayout(memory_group)
+
+        # Memory display
+        self.memory_label = QLabel("Memory: 0 MB")
+        memory_layout.addWidget(self.memory_label)
+
+        # Add clear data button
+        clear_btn = QPushButton("Clear All Data")
+        clear_btn.clicked.connect(self.clear_all_data)
+        clear_btn.setStyleSheet("QPushButton { color: red; }")
+        memory_layout.addWidget(clear_btn)
+
+        control_layout.addWidget(memory_group)
+
+        # Memory monitoring timer
+        from PyQt6.QtCore import QTimer
+        self.memory_timer = QTimer()
+        self.memory_timer.timeout.connect(self.update_memory_display)
+        self.memory_timer.start(3000)  # Update every 3 seconds
+
         # Add Z slice visualization controls with range limits
         slice_viz_group = QWidget()
         slice_viz_layout = QVBoxLayout(slice_viz_group)
@@ -200,12 +351,6 @@ class CylinderAnalyzerGUI(QMainWindow):
         compare_btn = QPushButton("Compare with Other Years")
         compare_btn.clicked.connect(self.compare_years)
         control_layout.addWidget(compare_btn)
-        
-        # VTK Widget for 3D visualization
-        self.vtk_widget = QVTKRenderWindowInteractor()
-        self.renderer = vtk.vtkRenderer()
-        self.vtk_widget.GetRenderWindow().AddRenderer(self.renderer)
-        self.renderer.SetBackground(0.1, 0.1, 0.1)
         
         # Add tabs for results
         self.results_tabs = QTabWidget()
@@ -300,95 +445,558 @@ class CylinderAnalyzerGUI(QMainWindow):
         # Add stats display
         self.stats_label = QLabel()
         control_layout.addWidget(self.stats_label)
+
+    def on_quality_changed(self, quality_text):
+        """Handle quality dropdown change"""
+        quality_map = {
+            "Ultra High": "ultra_high",
+            "High": "high", 
+            "Medium": "medium",
+            "Fast": "fast"
+        }
         
-    def load_file(self):
-        filename, _ = QFileDialog.getOpenFileName(
+        self.display_quality = quality_map[quality_text]
+        
+        if hasattr(self, 'points') and self.points is not None:
+            self.display_point_cloud()
+            
+            # Show quality info
+            total_points = len(self.points)
+            display_points = len(self.get_display_points())
+            ratio = (display_points / total_points) * 100
+            
+            self.statusBar().showMessage(
+                f"Display quality: {quality_text} - Showing {display_points:,}/{total_points:,} points ({ratio:.1f}%)"
+            )
+
+
+    def update_memory_display(self):
+        """Update memory usage display"""
+        try:
+            import psutil
+            process = psutil.Process()
+            memory_mb = process.memory_info().rss / (1024 * 1024)
+            
+            if hasattr(self, 'points') and self.points is not None:
+                points_mb = self.points.nbytes / (1024 * 1024)
+                self.memory_label.setText(f"RAM: {memory_mb:.0f}MB (Points: {points_mb:.0f}MB)")
+                
+                # Color coding
+                if memory_mb > 6000:  # 6GB - red
+                    self.memory_label.setStyleSheet("color: red; font-weight: bold;")
+                elif memory_mb > 4000:  # 4GB - orange
+                    self.memory_label.setStyleSheet("color: orange; font-weight: bold;")
+                elif memory_mb > 2000:  # 2GB - yellow
+                    self.memory_label.setStyleSheet("color: #FF8C00; font-weight: bold;")
+                else:  # < 2GB - green
+                    self.memory_label.setStyleSheet("color: green;")
+            else:
+                self.memory_label.setText(f"RAM: {memory_mb:.0f}MB (No data)")
+                self.memory_label.setStyleSheet("color: gray;")
+                
+        except ImportError:
+            self.memory_label.setText("RAM: psutil not available")
+        except Exception:
+            pass
+
+    def clear_all_data(self):
+        """Clear all loaded data to free memory"""
+        from PyQt6.QtWidgets import QMessageBox
+        
+        if not hasattr(self, 'points') or self.points is None:
+            self.statusBar().showMessage("No data to clear")
+            return
+        
+        reply = QMessageBox.question(
             self,
-            "Select Point Cloud",
+            "Clear All Data",
+            f"Are you sure you want to clear {len(self.points):,} points?\n"
+            f"This will free up memory but you'll lose all current data.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            # Clear all data
+            if hasattr(self, 'points'):
+                del self.points
+                self.points = None
+            
+            if hasattr(self, 'current_results'):
+                del self.current_results
+            
+            # Clear VTK actors
+            if hasattr(self, 'point_cloud_actor') and self.point_cloud_actor:
+                self.renderer_original.RemoveActor(self.point_cloud_actor)
+                self.point_cloud_actor = None
+            
+            if hasattr(self, 'slice_actors'):
+                for actor in self.slice_actors:
+                    self.renderer_slices.RemoveActor(actor)
+                self.slice_actors = []
+            
+            # Clear plots
+            self.figure.clear()
+            self.canvas.draw()
+            self.slice_figure.clear()
+            self.slice_canvas.draw()
+            
+            # Update VTK
+            self.vtk_widget_original.GetRenderWindow().Render()
+            self.vtk_widget_slices.GetRenderWindow().Render()
+            
+            # Disable controls
+            self.z_slice_input.setEnabled(False)
+            self.show_slice_btn.setEnabled(False)
+            self.viz_slice_thickness.setEnabled(False)
+            self.export_btn.setEnabled(False)
+            
+            # Force garbage collection
+            import gc
+            gc.collect()
+            
+            self.statusBar().showMessage("All data cleared - memory freed")
+
+    def load_file(self):
+        # Allow multi-file selection but load incrementally
+        filenames, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select Point Cloud File(s) - Multiple files will be loaded incrementally",
             "",
             "Point Cloud Files (*.txt *.csv *.xyz);;All Files (*.*)"
         )
         
-        if filename:
-            # Show progress bar and disable UI
-            self.progress_bar.setVisible(True)
-            self.progress_bar.setValue(0)
-            self.setEnabled(False)
-            self.statusBar().showMessage("Loading point cloud...")
+        if not filenames:
+            return
+        
+        # Check if we already have data and determine mode
+        if hasattr(self, 'points') and self.points is not None:
+            from PyQt6.QtWidgets import QMessageBox
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Icon.Question)
+            msg.setWindowTitle("Data Already Loaded")
+            msg.setText(f"You already have {len(self.points):,} points loaded.")
+            msg.setInformativeText(f"Selected {len(filenames)} new file(s). What would you like to do?")
             
-            # Create and start worker thread
-            self.load_worker = LoadPointCloudWorker(filename)
-            self.load_worker.progress.connect(self.update_progress)
-            self.load_worker.finished.connect(self.load_finished)
-            self.load_worker.error.connect(self.load_error)
-            self.load_worker.start()
+            append_button = msg.addButton("Append all files to existing data", QMessageBox.ButtonRole.YesRole)
+            replace_button = msg.addButton("Replace with new files", QMessageBox.ButtonRole.NoRole)
+            cancel_button = msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            
+            msg.setDefaultButton(append_button)
+            result = msg.exec()
+            clicked_button = msg.clickedButton()
+            
+            if clicked_button == append_button:
+                self.append_mode = True
+            elif clicked_button == replace_button:
+                self.append_mode = False
+                # Clear existing data first
+                if hasattr(self, 'points'):
+                    del self.points
+                    self.points = None
+                    import gc
+                    gc.collect()
+            else:
+                return
+        else:
+            self.append_mode = False
+        
+        # Start incremental loading
+        self.start_incremental_loading(filenames)
+
+    def start_incremental_loading(self, filenames):
+        """Load multiple files incrementally to avoid memory overflow"""
+        self.files_to_load = filenames.copy()
+        self.total_files = len(filenames)
+        self.current_file_index = 0
+        self.files_loaded = 0
+        
+        # Show progress bar and disable UI
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.setEnabled(False)
+        
+        # Start loading first file
+        self.load_next_file()
+
+    def load_next_file(self):
+        """Load the next file in the queue"""
+        if self.current_file_index >= len(self.files_to_load):
+            # All files loaded, finish up
+            self.finish_incremental_loading()
+            return
+        
+        current_file = self.files_to_load[self.current_file_index]
+        
+        # Calculate overall progress
+        overall_progress = int((self.current_file_index / self.total_files) * 90)
+        self.progress_bar.setValue(overall_progress)
+        
+        # Show status
+        remaining = self.total_files - self.current_file_index
+        self.statusBar().showMessage(
+            f"Loading file {self.current_file_index + 1}/{self.total_files}: "
+            f"{os.path.basename(current_file)} ({remaining} remaining)"
+        )
+        
+        # Create worker for current file
+        self.current_load_worker = LoadPointCloudWorker(current_file)
+        self.current_load_worker.progress.connect(self.update_file_progress)
+        self.current_load_worker.finished.connect(self.single_file_loaded)
+        self.current_load_worker.error.connect(self.incremental_load_error)
+        self.current_load_worker.start()
+
+    def update_file_progress(self, file_progress):
+        """Update progress for current file loading"""
+        # Combine overall progress with current file progress
+        overall_progress = int((self.current_file_index / self.total_files) * 90)
+        file_contribution = int((file_progress / 100) * (90 / self.total_files))
+        total_progress = overall_progress + file_contribution
+        self.progress_bar.setValue(min(total_progress, 95))
+
+    def single_file_loaded(self, result):
+        """Handle completion of single file loading"""
+        new_points, num_new_points = result
+        
+        try:
+            # Get file info for reporting
+            current_file = self.files_to_load[self.current_file_index]
+            file_memory_mb = new_points.nbytes / (1024*1024)
+            
+            # Combine with existing data if we have any
+            if hasattr(self, 'points') and self.points is not None:
+                # Memory check before combining
+                existing_memory_mb = self.points.nbytes / (1024*1024)
+                total_memory_mb = existing_memory_mb + file_memory_mb
+                
+                # Warning if getting close to memory limit
+                if total_memory_mb > 6000:  # 6GB warning
+                    from PyQt6.QtWidgets import QMessageBox
+                    
+                    remaining_files = self.total_files - self.current_file_index - 1
+                    estimated_total_mb = total_memory_mb * (1 + remaining_files * 0.5)  # Rough estimate
+                    
+                    reply = QMessageBox.warning(
+                        self,
+                        "High Memory Usage Warning",
+                        f"Current memory usage: {total_memory_mb:.0f}MB\n"
+                        f"Estimated final usage: {estimated_total_mb:.0f}MB\n"
+                        f"Remaining files: {remaining_files}\n\n"
+                        f"Continue loading? (You can stop now to avoid memory issues)",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.Yes
+                    )
+                    
+                    if reply == QMessageBox.StandardButton.No:
+                        # Stop loading, finish with current data
+                        self.finish_incremental_loading()
+                        return
+                
+                # Combine data
+                old_count = len(self.points)
+                combined_points = np.vstack([self.points, new_points])
+                
+                # Clear old data to free memory
+                del self.points
+                del new_points
+                import gc
+                gc.collect()
+                
+                self.points = combined_points
+                
+                self.statusBar().showMessage(
+                    f"Added {num_new_points:,} points from {os.path.basename(current_file)}. "
+                    f"Total: {len(self.points):,} points"
+                )
+                
+            else:
+                # First file
+                self.points = new_points
+                self.statusBar().showMessage(f"Loaded {num_new_points:,} points from {os.path.basename(current_file)}")
+            
+            self.files_loaded += 1
+            
+        except MemoryError:
+            self.statusBar().showMessage(f"Memory error loading {os.path.basename(current_file)} - stopping here")
+            self.finish_incremental_loading()
+            return
+        except Exception as e:
+            self.statusBar().showMessage(f"Error combining {os.path.basename(current_file)}: {str(e)}")
+        
+        # Move to next file
+        self.current_file_index += 1
+        
+        # Small delay to allow UI updates and memory cleanup
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(100, self.load_next_file)
+
+    def incremental_load_error(self, error_msg):
+        """Handle error during incremental loading"""
+        current_file = self.files_to_load[self.current_file_index]
+        self.statusBar().showMessage(f"Error loading {os.path.basename(current_file)}: {error_msg}")
+        
+        # Skip this file and continue with next
+        self.current_file_index += 1
+        
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(100, self.load_next_file)
+
+    def finish_incremental_loading(self):
+        """Finish incremental loading process"""
+        # Clean up loading state
+        if hasattr(self, 'current_load_worker'):
+            del self.current_load_worker
+        
+        # Update UI if we have data
+        if hasattr(self, 'points') and self.points is not None:
+            self.update_ui_after_load()
+            
+            # Show final stats
+            final_memory_mb = self.points.nbytes / (1024*1024)
+            self.statusBar().showMessage(
+                f"Incremental loading complete! Loaded {self.files_loaded}/{self.total_files} files. "
+                f"Total: {len(self.points):,} points ({final_memory_mb:.0f}MB)"
+            )
+        else:
+            self.statusBar().showMessage("No data loaded")
+            self.setEnabled(True)
+            self.progress_bar.setVisible(False)
+        
+        # Clean up
+        if hasattr(self, 'files_to_load'):
+            del self.files_to_load
 
     def load_finished(self, result):
-        points, num_points = result
-        self.points = points
+        """Backup method for single file loading (kept for compatibility)"""
+        new_points, num_new_points = result
+        
+        # Handle append vs replace mode (same logic as before)
+        if hasattr(self, 'append_mode') and self.append_mode and hasattr(self, 'points') and self.points is not None:
+            # Append mode logic (same as before)
+            old_count = len(self.points)
+            old_memory_mb = self.points.nbytes / (1024*1024)
+            new_memory_mb = new_points.nbytes / (1024*1024)
+            total_memory_mb = old_memory_mb + new_memory_mb
+            
+            if total_memory_mb > 4000:  # 4GB warning
+                from PyQt6.QtWidgets import QMessageBox
+                reply = QMessageBox.warning(
+                    self,
+                    "Memory Warning",
+                    f"Combined data will use ~{total_memory_mb:.0f}MB RAM\n"
+                    f"Current: {old_memory_mb:.0f}MB + New: {new_memory_mb:.0f}MB\n\n"
+                    f"This may cause performance issues. Continue?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No
+                )
+                
+                if reply == QMessageBox.StandardButton.No:
+                    self.progress_bar.setVisible(False)
+                    self.setEnabled(True)
+                    self.statusBar().showMessage("Loading cancelled due to memory concerns")
+                    return
+            
+            try:
+                combined_points = np.vstack([self.points, new_points])
+                del self.points
+                del new_points
+                import gc
+                gc.collect()
+                
+                self.points = combined_points
+                total_points = len(self.points)
+                
+                self.statusBar().showMessage(f"Appended {num_new_points:,} points. Total: {total_points:,} points (was {old_count:,})")
+                
+            except MemoryError:
+                self.statusBar().showMessage("Not enough memory to combine point clouds")
+                self.progress_bar.setVisible(False)
+                self.setEnabled(True)
+                return
+            except Exception as e:
+                self.statusBar().showMessage(f"Error combining data: {str(e)}")
+                self.progress_bar.setVisible(False)
+                self.setEnabled(True)
+                return
+        else:
+            # Replace mode
+            if hasattr(self, 'points') and self.points is not None:
+                del self.points
+                import gc
+                gc.collect()
+            
+            self.points = new_points
+            self.statusBar().showMessage(f"Loaded {num_new_points:,} points")
+        
+        # Update UI
+        self.update_ui_after_load()
+        
+        final_memory_mb = self.points.nbytes / (1024*1024)
+        self.statusBar().showMessage(f"Ready - {len(self.points):,} points ({final_memory_mb:.0f}MB)")
+
+    def update_ui_after_load(self):
+        """Update UI elements after loading data"""
+        # Clear old analysis results
+        if hasattr(self, 'current_results'):
+            del self.current_results
+            self.export_btn.setEnabled(False)
+        
+        # Clear VTK actors
+        if hasattr(self, 'point_cloud_actor') and self.point_cloud_actor:
+            self.renderer_original.RemoveActor(self.point_cloud_actor)
+            self.point_cloud_actor = None
+        
+        if hasattr(self, 'slice_actors'):
+            for actor in self.slice_actors:
+                self.renderer_slices.RemoveActor(actor)
+            self.slice_actors = []
         
         # Update Z range based on loaded data
         z_min = np.min(self.points[:, 2])
         z_max = np.max(self.points[:, 2])
+        z_range = z_max - z_min
         
         # Set Z spinbox range and initial value
         self.z_slice_input.setRange(z_min, z_max)
-        self.z_slice_input.setValue(z_min + (z_max - z_min)/2)  # Set to middle
-        self.z_slice_input.setSingleStep((z_max - z_min)/50)  # Reasonable step size
+        self.z_slice_input.setValue(z_min + z_range/2)
+        self.z_slice_input.setSingleStep(z_range/50)
 
         # Set reasonable default thickness based on data range
-        z_range = z_max - z_min
-        default_thickness = max(0.5, z_range / 50)  # At least 0.5m or 1/50 of total range
+        default_thickness = max(0.5, z_range / 50)
         self.viz_slice_thickness.setValue(default_thickness)
 
-        # Enable Z slice controls
+        # Enable controls
         self.z_slice_input.setEnabled(True)
         self.show_slice_btn.setEnabled(True)
         self.viz_slice_thickness.setEnabled(True)
         
+        # Update displays
         self.display_point_cloud()
-
         self.show_statistics()
-
+        
+        # Clear plots
+        self.figure.clear()
+        self.canvas.draw()
+        self.slice_figure.clear()
+        self.slice_canvas.draw()
+        
         self.progress_bar.setVisible(False)
         self.setEnabled(True)
-        self.statusBar().showMessage(f"Loaded {num_points} points")
 
     def load_error(self, error_msg):
         self.progress_bar.setVisible(False)
         self.setEnabled(True)
         self.statusBar().showMessage(f"Error loading file: {error_msg}")
-    
+
+    def set_display_quality(self, quality):
+        """Set display quality and refresh if we have data"""
+        self.display_quality = quality
+        if hasattr(self, 'points') and self.points is not None:
+            self.display_point_cloud()
+
     def display_point_cloud(self):
         if self.point_cloud_actor:
             self.renderer_original.RemoveActor(self.point_cloud_actor)
             
+        # Get points based on current quality setting
+        display_points = self.get_display_points()
+        
+        # Get point size from quality setting
+        quality_settings = {
+            'ultra_high': {'max_points': 2000000, 'point_size': 3},
+            'high': {'max_points': 1000000, 'point_size': 3},
+            'medium': {'max_points': 200000, 'point_size': 2},
+            'fast': {'max_points': 50000, 'point_size': 1}
+        }
+        point_size = quality_settings[self.display_quality]['point_size']
+        
+        # Show loading message for large datasets
+        if len(display_points) > 500000:
+            self.statusBar().showMessage(f"Rendering {len(display_points):,} points (this may take a moment)...")
+        
         # Create VTK points
         vtk_points = vtk.vtkPoints()
-        for point in self.points:
+        for point in display_points:
             vtk_points.InsertNextPoint(point[0], point[1], point[2])
             
         polydata = vtk.vtkPolyData()
         polydata.SetPoints(vtk_points)
         
-        # Vertex filter
         vertex_filter = vtk.vtkVertexGlyphFilter()
         vertex_filter.SetInputData(polydata)
         vertex_filter.Update()
         
-        # Create mapper and actor
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(vertex_filter.GetOutputPort())
         
         self.point_cloud_actor = vtk.vtkActor()
         self.point_cloud_actor.SetMapper(mapper)
         self.point_cloud_actor.GetProperty().SetColor(0.5, 0.5, 1.0)
-        self.point_cloud_actor.GetProperty().SetPointSize(3)
+        self.point_cloud_actor.GetProperty().SetPointSize(point_size)
         
         self.renderer_original.AddActor(self.point_cloud_actor)
         self.renderer_original.ResetCamera()
         self.vtk_widget_original.GetRenderWindow().Render()
+        
+        # Show completion message with details
+        total_points = len(self.points)
+        display_ratio = (len(display_points) / total_points) * 100
+        quality_name = self.quality_dropdown.currentText()
+        
+        self.statusBar().showMessage(
+            f"{quality_name} quality: {len(display_points):,}/{total_points:,} points ({display_ratio:.1f}%) rendered"
+        )
     
+    def get_display_points(self):
+        """Get subsampled points based on current quality setting"""
+        if self.points is None:
+            return np.array([])
+        
+        # Updated quality settings with Ultra High option
+        quality_settings = {
+            'ultra_high': {'max_points': 2000000, 'point_size': 3},  # 2M points - much higher
+            'high': {'max_points': 1000000, 'point_size': 3},        # 1M points
+            'medium': {'max_points': 200000, 'point_size': 2},       # 200K points  
+            'fast': {'max_points': 50000, 'point_size': 1}          # 50K points
+        }
+        
+        settings = quality_settings.get(self.display_quality, quality_settings['medium'])
+        max_points = settings['max_points']
+        total_points = len(self.points)
+        
+        if total_points <= max_points:
+            # If data is smaller than limit, show all points
+            return self.points
+        
+        # Smart subsampling based on ratio
+        sample_ratio = max_points / total_points
+        
+        if sample_ratio > 0.8:  # > 80% - use random sampling
+            indices = np.random.choice(total_points, max_points, replace=False)
+            return self.points[indices]
+        elif sample_ratio > 0.5:  # 50-80% - mixed sampling for better coverage
+            # Use systematic + random sampling
+            systematic_count = int(max_points * 0.7)
+            random_count = max_points - systematic_count
+            
+            # Systematic sampling
+            step = total_points // systematic_count
+            systematic_indices = np.arange(0, total_points, step)[:systematic_count]
+            
+            # Random sampling from remaining points
+            remaining_indices = np.setdiff1d(np.arange(total_points), systematic_indices)
+            if len(remaining_indices) >= random_count:
+                random_indices = np.random.choice(remaining_indices, random_count, replace=False)
+                all_indices = np.concatenate([systematic_indices, random_indices])
+            else:
+                all_indices = systematic_indices
+                
+            return self.points[all_indices]
+        else:  # < 50% - systematic sampling only
+            step = int(1 / sample_ratio)
+            indices = np.arange(0, total_points, step)[:max_points]
+            return self.points[indices]
+        
     def analyze_current(self):
         if self.points is None:
             self.statusBar().showMessage("Please load point cloud first")
@@ -770,50 +1378,6 @@ class CylinderAnalyzerGUI(QMainWindow):
             f"Points: {total_points:,} | Main axis: {main_axis} | "
             f"{main_axis} range: {max(ranges):.3f}m"
         )
-
-    # Add this method to the CylinderAnalyzerGUI class
-
-    def load_comparison_files(self):
-        filenames, _ = QFileDialog.getOpenFileNames(
-            self,
-            "Select Point Cloud Files for Comparison",
-            "",
-            "Point Cloud Files (*.txt *.csv *.xyz);;All Files (*.*)"
-        )
-        
-        if not filenames:
-            return []
-            
-        comparison_data = []
-        for filename in filenames:
-            try:
-                # Show progress
-                self.statusBar().showMessage(f"Loading {filename}...")
-                self.progress_bar.setVisible(True)
-                self.progress_bar.setValue(0)
-                
-                # Create and run worker for each file
-                worker = LoadPointCloudWorker(filename)
-                worker.progress.connect(self.update_progress)
-                worker.start()
-                worker.wait()  # Wait for completion
-                
-                # Get year from filename (assuming format YYYY_*.txt)
-                try:
-                    year = os.path.basename(filename).split('_')[0]
-                except:
-                    year = os.path.basename(filename)
-                
-                points = np.loadtxt(filename)
-                if points.shape[1] >= 3:  # Ensure we have x,y,z columns
-                    comparison_data.append((year, points))
-                
-            except Exception as e:
-                self.statusBar().showMessage(f"Error loading {filename}: {str(e)}")
-                continue
-                
-        self.progress_bar.setVisible(False)
-        return comparison_data
 
     # Add this method to CylinderAnalyzerGUI class
     def export_results(self):
